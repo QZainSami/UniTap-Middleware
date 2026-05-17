@@ -1,0 +1,349 @@
+/*
+ * UniTap POS Terminal - Full UI Version
+ * Hardware: ESP32-S3, 1.3" SH1106 OLED (I2C 21/47), Buzzer (12), Boot Button (0)
+ */
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFiClientSecure.h>
+
+// --- RFID PINS ---
+#define RST_PIN         5          
+#define SS_PIN          10         
+MFRC522 mfrc522(SS_PIN, RST_PIN);  
+
+// --- USER CONFIGURATION ---
+const char *ssid = "Zain";
+const char *password = "123zainu";
+String serverIp = "192.168.100.43";
+String currentPrice = "Rs. --.--";
+
+// --- HARDWARE PINS ---
+#define SDA_PIN 21
+#define SCL_PIN 47
+#define BUZZER_PIN 4
+#define BOOT_BUTTON 0
+
+#define i2c_Address 0x3c
+Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+
+  // Setup Buzzer (Version 2.0.x style)
+  ledcSetup(0, 2500, 8);
+  ledcAttachPin(BUZZER_PIN, 0);
+
+  // Init SPI and RFID
+  SPI.begin(12, 13, 11, 10); // SCK, MISO, MOSI, SS
+  mfrc522.PCD_Init();
+
+  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  Serial.print(F("RC522 Software Version: 0x"));
+  Serial.println(v, HEX);
+  if (v == 0x00 || v == 0xFF) {
+    Serial.println(F("WARNING: Communication failure! Check wiring."));
+  }
+
+  // Initialize Screen
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(i2c_Address, true);
+
+  showBootLogo();
+  connectWiFi();
+  checkServerHandshake();
+}
+
+void loop() {
+  // 1. Handle Idle UI
+  static unsigned long lastIdleBlink = 0;
+  static bool showTapText = true;
+  if (millis() - lastIdleBlink > 800) {
+    drawIdleScreen(showTapText);
+    showTapText = !showTapText;
+    lastIdleBlink = millis();
+  }
+
+  // 2. CHECK FOR RFID SCAN (The missing part!)
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    String uid = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      uid += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+      uid += String(mfrc522.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+    Serial.println("Card Detected: " + uid);
+    processPayment(uid); // Send the actual card ID to your Python server
+    
+    // Halt RFID to prevent multiple scans
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+
+  // 3. Keep your existing Button/Serial triggers
+  if (digitalRead(BOOT_BUTTON) == LOW) {
+    processPayment("12345"); 
+    delay(500);
+  }
+}
+
+// ==========================================
+// CORE LOGIC: PAYMENT PROCESSING
+// ==========================================
+void processPayment(String uid)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    showErrorScreen("NETWORK ERR", "No WiFi");
+    return;
+  }
+
+  // Show "Authorizing..." animation
+  playTone(3000, 100);
+  showProcessingAnimation();
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Tell ESP32 to accept our local Python certificate
+  HTTPClient http;
+  
+  String url = "https://" + serverIp + ":5000/payment";
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{\"uid\":\"" + uid + "\"}";
+  int httpCode = http.POST(json);
+
+  if (httpCode > 0)
+  {
+    String response = http.getString();
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, response);
+
+    String status = doc["status"];
+    String name = doc["name"];
+    String msg = doc["msg"];
+
+    if (status == "SUCCESS")
+    {
+      showSuccessScreen(name, msg);
+    }
+    else
+    {
+      showErrorScreen(status, msg);
+    }
+  }
+  else
+  {
+    showErrorScreen("API ERROR", "Timeout / Code " + String(httpCode));
+  }
+
+  http.end();
+  delay(3500);            // Keep result on screen for 3.5 seconds
+  display.clearDisplay(); // Clear before going back to idle
+}
+
+// ==========================================
+// UI DRAWING FUNCTIONS
+// ==========================================
+
+void centerText(String text, int size, int y)
+{
+  display.setTextSize(size);
+  int textWidth = text.length() * (size * 6); // Approx width in pixels
+  int x = (128 - textWidth) / 2;
+  display.setCursor(x, y);
+  display.println(text);
+}
+
+void playTone(int freq, int duration)
+{
+  ledcWriteTone(0, freq);
+  delay(duration);
+  ledcWriteTone(0, 0);
+}
+
+void showBootLogo()
+{
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 64, SH110X_WHITE);
+  display.fillRect(0, 0, 128, 16, SH110X_WHITE);
+
+  display.setTextColor(SH110X_BLACK);
+  centerText("UniTap", 1, 4);
+
+  display.setTextColor(SH110X_WHITE);
+  centerText("PoS Terminal", 1, 25);
+  centerText("v1.0.0", 1, 40);
+  display.display();
+  delay(1500);
+}
+
+void connectWiFi()
+{
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  centerText("Connecting", 1, 20);
+  centerText("to WiFi...", 1, 35);
+  display.display();
+
+  WiFi.begin(ssid, password);
+  int dotCount = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    display.fillRect(30, 50, 68, 10, SH110X_BLACK); // Clear dots area
+    String dots = "";
+    for (int i = 0; i <= dotCount; i++)
+      dots += ".";
+    centerText(dots, 1, 50);
+    display.display();
+    dotCount = (dotCount + 1) % 4;
+    delay(400);
+  }
+}
+
+void checkServerHandshake()
+{
+  display.clearDisplay();
+  centerText("Connecting", 1, 20);
+  centerText("to Bank API...", 1, 35);
+  display.display();
+
+  // --- ADDED SECURE CLIENT LOGIC HERE ---
+  WiFiClientSecure client;
+  client.setInsecure(); 
+  
+  HTTPClient http;
+  String url = "https://" + serverIp + ":5000/check-status"; // Changed to https
+  http.begin(client, url); // Passed the secure client here
+  
+  int httpCode = http.GET();
+  
+  display.clearDisplay();
+  if (httpCode > 0)
+  {
+    String payload = http.getString();
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, payload);
+    
+    float price = doc["price"];
+    currentPrice = "Rs. " + String(price, 2); 
+
+    centerText("API: ONLINE", 2, 15);
+    display.display();
+    playTone(3000, 150);
+    delay(1000);
+  }
+  else
+  {
+    centerText("API OFFLINE", 2, 15);
+    centerText("Check Server IP!", 1, 40);
+    display.display();
+    playTone(500, 1500); 
+    while (1); 
+  }
+  http.end();
+}
+
+void drawWiFiIcon(int x, int y)
+{
+  display.fillCircle(x, y + 6, 1, SH110X_BLACK);
+  display.drawCircleHelper(x, y + 6, 4, 3, SH110X_BLACK);
+  display.drawCircleHelper(x, y + 6, 7, 3, SH110X_BLACK);
+}
+
+void drawIdleScreen(bool showTap)
+{
+  // 1. Top Bar (Stays perfectly still)
+  display.fillRect(0, 0, 128, 14, SH110X_WHITE);
+  display.setTextSize(1); 
+  display.setTextColor(SH110X_BLACK);
+  display.setCursor(2, 3);
+  display.print("UniTap PoS");
+
+  // 2. WiFi Icon in top right
+  display.setTextColor(SH110X_WHITE); 
+  drawWiFiIcon(118, 2);
+
+  // 3. FIX: Erase the middle AND bottom sections by drawing a black box 
+  // from just under the top bar (Y=14) all the way to the bottom.
+  display.fillRect(0, 14, 128, 50, SH110X_BLACK); 
+
+  // 4. Main Content (Price)
+  centerText(currentPrice, 2, 25); // Note: Change to currentPrice if using the dynamic Python pricing
+
+  // 5. Blinking Tap Text
+  if (showTap)
+  {
+    centerText("Please Tap Card", 1, 50);
+  }
+
+  // Push updates to screen
+  display.display();
+}
+
+void showProcessingAnimation()
+{
+  for (int i = 0; i <= 100; i += 15)
+  {
+    display.clearDisplay();
+    centerText("Authorizing", 1, 20);
+
+    // Draw Progress Bar Frame
+    display.drawRect(14, 40, 100, 10, SH110X_WHITE);
+    // Fill Bar
+    display.fillRect(16, 42, (i * 96) / 100, 6, SH110X_WHITE);
+
+    display.display();
+    delay(100); // Fake processing delay
+  }
+}
+
+void showSuccessScreen(String name, String msg)
+{
+  display.clearDisplay();
+
+  // Draw Checkmark
+  display.drawLine(50, 25, 60, 35, SH110X_WHITE);
+  display.drawLine(50, 26, 60, 36, SH110X_WHITE);
+  display.drawLine(60, 35, 80, 10, SH110X_WHITE);
+  display.drawLine(60, 36, 80, 11, SH110X_WHITE);
+
+  centerText("APPROVED", 1, 40);
+  centerText(name + " - " + msg, 1, 56);
+  display.display();
+
+  // Happy Beeps
+  playTone(2000, 100);
+  delay(50);
+  playTone(3000, 200);
+}
+
+void showErrorScreen(String errorType, String msg)
+{
+  // Invert display for visual alert
+  display.invertDisplay(true);
+  display.clearDisplay();
+
+  // Draw an X
+  display.drawLine(56, 22, 62, 28, SH110X_WHITE); // Short leg
+  display.drawLine(56, 23, 62, 29, SH110X_WHITE); // Short leg thickness
+  display.drawLine(62, 28, 72, 14, SH110X_WHITE); // Long leg
+  display.drawLine(62, 29, 72, 15, SH110X_WHITE); // Long leg thickness
+
+  centerText("DECLINED", 2, 42);
+  centerText(msg, 1, 56);
+  display.display();
+
+  // Angry Beep
+  playTone(800, 800);
+
+  // Restore display colors
+  display.invertDisplay(false);
+}
