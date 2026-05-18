@@ -16,11 +16,11 @@
 // ==========================================
 // 1. GLOBAL CONFIGURATION (From Implementation Guide)
 // ==========================================
-const char* WIFI_SSID = "Zain";
-const char* WIFI_PASS = "123zainu";
-const char* API_BASE_URL = "https://unitap.refinedev.org/api/terminal";
+const char* WIFI_SSID = "Mi10T";
+const char* WIFI_PASS = "asdfghjk";
+const char* API_BASE_URL = "https://unitap-api.refinedev.org/api/terminal";
 const char* API_KEY = "your_esp32_api_key_here";
-const char* TERMINAL_ID = "CANTEEN-01";
+const char* TERMINAL_ID = "TERM-CANTEEN-01";
 
 float currentPendingAmount = 0.0;
 String currentScannedUID = ""; // Temporarily hold UID before processing
